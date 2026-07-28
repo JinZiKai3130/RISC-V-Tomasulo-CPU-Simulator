@@ -1,6 +1,8 @@
 #include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <map>
+#include <sstream>
 
 class Memory {
 private:
@@ -73,8 +75,8 @@ DecodedInst decode(uint32_t inst) {
     }
   } else if (dec.opcode == 0x63) {
     // B
-    dec.imm = (dec.rd >> 1) | (dec.funct7 >> 5) & 0x3f |
-              ((dec.rd & 0x1) << 11) | ((dec.funct7 & 0x40) << 12);
+    dec.imm = (dec.rd & 0x1e) | ((dec.funct7 & 0x3f) << 5) |
+              ((dec.rd & 0x1) << 11) | ((dec.funct7 & 0x40) << 6);
     if (dec.imm & (1 << 12)) {
       dec.imm |= 0xfffff800;
     }
@@ -278,11 +280,39 @@ private:
   uint32_t pc;
 
   bool halted;
+  int cnt;
 
 public:
-  Simulator() : regs{}, pc(0), halted(false) {}
+  Simulator() : regs{}, pc(0), halted(false), cnt(0) {}
+
+  void load_program() {
+    std::string line;
+    uint32_t addr = 0;
+    while (std::getline(std::cin, line)) {
+      if (line[0] == '@') {
+        addr = std::stoul(line.substr(1), nullptr, 16);
+      } else {
+        std::istringstream iss(line);
+        std::string byte_str;
+        while (iss >> byte_str) {
+          uint8_t byte = (uint8_t)std::stoul(byte_str, nullptr, 16);
+          memory.write_byte(addr++, byte);
+        }
+      }
+    }
+  }
+
   void tick() {
+    if (halted)
+      return;
     uint32_t inst = memory.read_word(pc);
+    // printf("pc=%08x inst = %08x\n", pc, inst);
+
+    if (inst == 0x0ff00513) {
+      std::cout << (regs[10] & 0xff) << std::endl;
+      halted = true;
+      return;
+    }
     DecodedInst dec = decode(inst);
     execute(dec, pc, regs, memory, halted);
   }
@@ -292,8 +322,12 @@ public:
 
 int main() {
   Simulator sim;
-
+  sim.load_program();
+  //   int cnt = 0;
   while (!sim.is_halted()) {
+    // cnt++;
+    // if (cnt > 50)
+    //   return 0;
     sim.tick();
   }
   return 0;
