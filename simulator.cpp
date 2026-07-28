@@ -65,20 +65,20 @@ DecodedInst decode(uint32_t inst) {
     // I
     dec.imm = dec.rs2 | (dec.funct7 << 5);
     if (dec.imm & (1 << 11)) {
-      dec.imm |= 0xfffffc00;
+      dec.imm |= 0xfffff800;
     }
   } else if (dec.opcode == 0x23) {
     // S
     dec.imm = dec.rd | (dec.funct7 << 5);
     if (dec.imm & (1 << 11)) {
-      dec.imm |= 0xfffffc00;
+      dec.imm |= 0xfffff800;
     }
   } else if (dec.opcode == 0x63) {
     // B
     dec.imm = (dec.rd & 0x1e) | ((dec.funct7 & 0x3f) << 5) |
               ((dec.rd & 0x1) << 11) | ((dec.funct7 & 0x40) << 6);
     if (dec.imm & (1 << 12)) {
-      dec.imm |= 0xfffff800;
+      dec.imm |= 0xfffff000;
     }
   } else if (dec.opcode == 0x6f) {
     // J
