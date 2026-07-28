@@ -92,43 +92,181 @@ DecodedInst decode(uint32_t inst) {
   return dec;
 }
 
-void execute(DecodedInst &dec, uint32_t &pc, uint32_t regs[32], Memory &mem) {
+void execute(DecodedInst &dec, uint32_t &pc, uint32_t regs[32], Memory &mem,
+             bool &halted) {
   uint32_t cur_pc = pc;
+  pc = cur_pc + 4;
 
   switch (dec.opcode) {
   case 0x13: // I和I*
-    regs[dec.rd] = regs[dec.rs1] + dec.imm;
-    pc = cur_pc + 4;
+    switch (dec.funct3) {
+    case 0x0:
+      regs[dec.rd] = regs[dec.rs1] + dec.imm;
+      break;
+
+    case 0x1:
+      regs[dec.rd] = regs[dec.rs1] << (dec.imm & 0x1F);
+      break;
+
+    case 0x2:
+      regs[dec.rd] = ((int32_t)regs[dec.rs1] < dec.imm) ? 1 : 0;
+      break;
+
+    case 0x3:
+      regs[dec.rd] = (regs[dec.rs1] < (uint32_t)dec.imm) ? 1 : 0;
+      break;
+
+    case 0x4:
+      regs[dec.rd] = regs[dec.rs1] ^ dec.imm;
+      break;
+
+    case 0x5:
+      if (dec.funct7 == 0x00)
+        regs[dec.rd] = regs[dec.rs1] >> (dec.imm & 0x1F);
+      else if (dec.funct7 == 0x20)
+        regs[dec.rd] = (int32_t)regs[dec.rs1] >> (dec.imm & 0x1F);
+      break;
+
+    case 0x6:
+      regs[dec.rd] = regs[dec.rs1] | dec.imm;
+      break;
+
+    case 0x7:
+      regs[dec.rd] = regs[dec.rs1] & dec.imm;
+      break;
+    }
     break;
+
   case 0x33: // R
-    regs[dec.rd] = regs[dec.rs1] + regs[dec.rs2];
-    pc = cur_pc + 4;
+    switch (dec.funct3) {
+    case 0x0:
+      if (dec.funct7 == 0x00) {
+        regs[dec.rd] = regs[dec.rs1] + regs[dec.rs2];
+      } else {
+        regs[dec.rd] = regs[dec.rs1] + (~regs[dec.rs2] + 1);
+      }
+      break;
+
+    case 0x1:
+      regs[dec.rd] = regs[dec.rs1] << (regs[dec.rs2] & 0x1F);
+      break;
+
+    case 0x2:
+      regs[dec.rd] = ((int32_t)regs[dec.rs1] < (int32_t)regs[dec.rs2]) ? 1 : 0;
+      break;
+
+    case 0x3:
+      regs[dec.rd] = (regs[dec.rs1] < regs[dec.rs2]) ? 1 : 0;
+      break;
+
+    case 0x4:
+      regs[dec.rd] = regs[dec.rs1] ^ regs[dec.rs2];
+      break;
+
+    case 0x5:
+      if (dec.funct7 == 0x00)
+        regs[dec.rd] = regs[dec.rs1] >> (regs[dec.rs2] & 0x1F);
+      else if (dec.funct7 == 0x20)
+        regs[dec.rd] = (int32_t)regs[dec.rs1] >> (regs[dec.rs2] & 0x1F);
+      break;
+
+    case 0x6:
+      regs[dec.rd] = regs[dec.rs1] | regs[dec.rs2];
+      break;
+
+    case 0x7:
+      regs[dec.rd] = regs[dec.rs1] & regs[dec.rs2];
+      break;
+    }
     break;
+
   case 0x6f: // J
     regs[dec.rd] = cur_pc + 4;
     pc = cur_pc + dec.imm;
     break;
-  case 0x03: // I主要是(Load Word)部分
-    regs[dec.rd] = mem.read_word(regs[dec.rs1] + dec.imm);
-    pc = cur_pc + 4;
+  case 0x03: { // I主要是Load Word部分
+    uint32_t addr = regs[dec.rs1] + dec.imm;
+    switch (dec.funct3) {
+    case 0x0: // 带符号1byte
+      regs[dec.rd] = (int32_t)(int8_t)mem.read_byte(addr);
+      break;
+    case 0x1: // 带符号2byte
+      regs[dec.rd] = (int32_t)(int16_t)(mem.read_byte(addr) |
+                                        (mem.read_byte(addr + 1) << 8));
+      break;
+    case 0x2: // 这里是整个可以直接4byte读出
+      regs[dec.rd] = mem.read_word(addr);
+      break;
+    case 0x4: // 无符号1byte
+      regs[dec.rd] = mem.read_byte(addr);
+      break;
+    case 0x5: // 无符号2byte
+      regs[dec.rd] = mem.read_byte(addr) | (mem.read_byte(addr + 1) << 8);
+      break;
+    }
     break;
-  case 0x23: // S
-    mem.write_word(regs[dec.rs1] + dec.imm, regs[dec.rs2]);
-    pc = cur_pc + 4;
-    break;
-  case 0x63: // B
-    break;
-  case 0x67: // I jalr
-    break;
-  case 0x17: // U
-    break;
-  case 0x37: // U
-    break;
-  case 0x73: // I ebreak ecall
+  }
+  case 0x23: { // S：主要关于Store
+    uint32_t addr = regs[dec.rs1] + dec.imm;
+    switch (dec.funct3) {
+    case 0x0:
+      mem.write_byte(addr, regs[dec.rs2] & 0xFF);
+      break;
+    case 0x1:
+      mem.write_byte(addr, regs[dec.rs2] & 0xFF);
+      mem.write_byte(addr + 1, (regs[dec.rs2] >> 8) & 0xFF);
+      break;
+    case 0x2:
+      mem.write_word(addr, regs[dec.rs2]);
+      break;
+    }
     break;
   }
 
-  // 关键一步：无论如何，x0 永远为 0（防止之前的指令误写）
+  case 0x63: { // B 条件跳转
+    bool taken = false;
+    switch (dec.funct3) {
+    case 0x0:
+      taken = (regs[dec.rs1] == regs[dec.rs2]);
+      break;
+    case 0x1:
+      taken = (regs[dec.rs1] != regs[dec.rs2]);
+      break;
+    case 0x4:
+      taken = ((int32_t)regs[dec.rs1] < (int32_t)regs[dec.rs2]);
+      break;
+    case 0x5:
+      taken = ((int32_t)regs[dec.rs1] >= (int32_t)regs[dec.rs2]);
+      break;
+    case 0x6:
+      taken = (regs[dec.rs1] < regs[dec.rs2]);
+      break;
+    case 0x7:
+      taken = (regs[dec.rs1] >= regs[dec.rs2]);
+      break;
+    }
+    if (taken)
+      pc = cur_pc + dec.imm;
+    break;
+  }
+  case 0x67: // I jalr
+    regs[dec.rd] = cur_pc + 4;
+    pc = regs[dec.rs1] + dec.imm;
+    break;
+  case 0x17: // U
+    regs[dec.rd] = cur_pc + dec.imm;
+    break;
+  case 0x37: // U
+    regs[dec.rd] = dec.imm;
+    break;
+  case 0x73:
+    if (dec.imm == 0x0)
+      halted = true;
+    else if (dec.imm == 0x1)
+      halted = true;
+    break;
+  }
+
   regs[0] = 0;
 }
 
@@ -142,11 +280,21 @@ private:
   bool halted;
 
 public:
+  Simulator() : regs{}, pc(0), halted(false) {}
   void tick() {
     uint32_t inst = memory.read_word(pc);
     DecodedInst dec = decode(inst);
-    execute(dec, pc, regs, memory);
+    execute(dec, pc, regs, memory, halted);
   }
+
+  bool is_halted() { return halted; }
 };
 
-int main() { return 0; }
+int main() {
+  Simulator sim;
+
+  while (!sim.is_halted()) {
+    sim.tick();
+  }
+  return 0;
+}
