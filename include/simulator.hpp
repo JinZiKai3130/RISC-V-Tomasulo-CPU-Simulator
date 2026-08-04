@@ -25,7 +25,7 @@ private:
   int cycle_count = 0;
 
   // 指令类别（与 ROB/RS 的 op 字段保持一致）
-  enum { OP_ALU = 0, OP_BRANCH = 1, OP_STORE = 2, OP_LOAD = 3, OP_NOP = 4 };
+  enum { OP_ALU = 0, OP_BRANCH = 1, OP_STORE = 2, OP_LOAD = 3 };
 
   // ---------- 辅助函数：周期开始时快照，周期结束时交换 ----------
   void snapshot_all() {
@@ -74,7 +74,7 @@ private:
     }
     case OP_LOAD: {
       // 写寄存器 + 释放 LSQ 队首 + 释放 ROB 队首
-      if (lsq.commit_head(memory)) {
+      if (lsq.commit_head()) {
         if (head->dest_reg != 0)
           next_reg[head->dest_reg] = head->value;
         rob.commit_head();
@@ -82,10 +82,11 @@ private:
       break;
     }
     case OP_STORE: {
-      // 队首 store 提交：此刻才真正写内存（投机安全），然后释放
-      if (lsq.commit_head(memory)) {
+      // 队首 store 提交：此刻才正式启动内存写（投机期不碰内存）。
+      // 启动后由 LSQ::step() 串行写 3 周期，写完成当周期才提交 ROB。
+      lsq.start_commit_head();  // 未启动则标记 committed（排队写内存）
+      if (lsq.store_finished()) // 本周期写完成 → 释放 ROB 队首
         rob.commit_head();
-      }
       break;
     }
     case OP_BRANCH: {
@@ -133,15 +134,17 @@ private:
         rs.release(rs_idx);
     }
 
-    // ---- 2. store 内存访问完成 → 通知 ROB（标 ready）、释放其 RS ----
-    int st_idx = lsq.find_done_store();
+    // ---- 2. store 地址+数据就绪 → 通知 ROB（标 ready）、释放其 RS ----
+    // store 不再做投机期假访问：就绪即可通知 ROB；真正的内存写在提交
+    // 启动（lsq.start_commit_head）后由 LSQ::step() 串行执行。
+    int st_idx = lsq.find_ready_store();
     if (st_idx != -1) {
       int st_tag = lsq.get_rob_index(st_idx);
       rob.writeback(st_tag, 0); // store 无结果值，仅标 ready
       lsq.mark_broadcasted(st_idx);
-      int sidx = rs.find_by_rob(st_tag);
-      if (sidx != -1)
-        rs.release(sidx);
+      int rsidx = rs.find_by_rob(st_tag);
+      if (rsidx != -1)
+        rs.release(rsidx);
     }
   }
 

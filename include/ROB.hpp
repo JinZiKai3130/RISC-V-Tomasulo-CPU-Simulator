@@ -6,7 +6,7 @@ struct ROBEntry {
   int op;
   int dest_reg;
   uint32_t value; // 这里表示计算的结果，包括ALU的计算结果和load出来的数值
-  bool ready;     // 判别是否算完，等待CDB广播序列，来自ALU和load
+  bool ready;     // 判断是否算完，等待commit，变化来自write_back操作
   uint32_t pc;
   bool is_branch_taken;
   ROBEntry()
