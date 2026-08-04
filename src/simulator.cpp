@@ -3,12 +3,16 @@
 #include <iostream>
 #include <sstream>
 
-Simulator::Simulator() : regs{}, pc(0), halted(false), cnt(0) {}
+Simulator::Simulator()
+    : cur_reg{}, next_reg{}, cur_pc(0), next_pc(0), cur_halted(false),
+      next_halted(false), cycle_count(0) {}
 
 void Simulator::load_program() {
   std::string line;
   uint32_t addr = 0;
   while (std::getline(std::cin, line)) {
+    if (line.empty())
+      continue;
     if (line[0] == '@') {
       addr = std::stoul(line.substr(1), nullptr, 16);
     } else {
