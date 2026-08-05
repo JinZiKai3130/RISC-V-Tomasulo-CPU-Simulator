@@ -90,10 +90,29 @@ private:
       break;
     }
     case OP_BRANCH: {
-      // TODO(分支预测)：比较预测方向与实际方向，错误则
-      //   flush（清年轻 ROB/RS/LSQ）+ RAT 回滚 + next_pc = actual_target。
-      // 当前预测恒"不跳转"且尚未接入，先按顺序提交、不重定向。
-      rob.commit_head();
+      // 1. jal/jalr 写链接寄存器（pc+4，确定结果，与预测无关；条件分支 dest=-1
+      // 跳过）
+      if (head->dest_reg > 0)
+        next_reg[head->dest_reg] = head->value;
+      // 2. 比较预测 vs 实际：方向或目标任一不同 → 预测错误
+      bool mispred = (head->pred_taken != head->actual_taken) ||
+                     (head->pred_target != head->actual_target);
+      if (mispred) {
+        // 全部推翻重来：清空所有投机结构（ROB/RS/LSQ/RAT）。
+        // 已提交的寄存器/内存结果不受影响（分支在队首时比它老的都已提交），
+        // 从实际目标重新取指。
+        // 注意：错误路径上可能已取到 halt（next_halted=true），它是推测的，
+        // 必须一并复位——halt 不进流水线，分支之后的 halt 一定是错误路径的。
+        next_halted = false;
+        rob.flush();
+        rs.flush();
+        lsq.flush();
+        status.flush();
+        next_pc = head->actual_target;
+      } else {
+        // 预测正确：正常提交
+        rob.commit_head();
+      }
       break;
     }
     default:
@@ -122,9 +141,15 @@ private:
     if (tag != -1) {
       // 广播副作用（全部写各部件 next）
       rs.wakeup(tag, value);      // 唤醒 RS 依赖者（清 qj/qk）
-      rob.writeback(tag, value);  // 填 ROB（load/ALU 写结果；分支暂记目标）
+      rob.writeback(tag, value);  // 填 ROB（load/ALU 写结果；分支暂记 link 值）
       status.clear_if_match(tag); // 清 RAT
       lsq.set_data_by_rob(tag, value); // store 的数据到达
+
+      // 分支：把实际方向/目标写入 ROB（供 commit 时比较预测）
+      if (rs_idx != -1 && rs.peek(rs_idx).op == OP_BRANCH) {
+        const RS_Entry &e = rs.peek(rs_idx);
+        rob.set_branch_actual(tag, e.branch_taken, (uint32_t)e.branch_target);
+      }
 
       if (lsq_idx != -1) {
         lsq.mark_broadcasted(lsq_idx);
@@ -330,16 +355,18 @@ private:
     if ((is_load || is_store) && lsq.is_full())
       return;
 
-    // 5. 分支预测：目前留出，统一预测"不跳转"
-    //    之后接入 Predictor 时，用预测器输出替换 pred_taken / pred_target
+    // 5. 分支预测：统一预测"不跳转"（即顺序执行下一条 pc+4）。
+    //    之后接入 Predictor 时，用预测器输出替换 pred_taken / pred_target。
+    //    预测方向/目标会存入 ROB，commit 时与实际结果比较。
     bool pred_taken = false;
     uint32_t pred_target = cur_pc + 4;
-    (void)pred_taken; // 占位：接入分支预测器后移除
 
-    // 6. 分配 ROB 槽位（branch / store 不写寄存器，dest_reg = -1）
+    // 6. 分配 ROB 槽位（条件分支不写寄存器；jump 写 link 值；store 不写）
     bool writes_reg = !is_branch && !is_store;
     int dest_reg = writes_reg ? (int)dec.rd : -1;
     int rob_idx = rob.allocate(op_type, dest_reg, cur_pc);
+    // 记录预测方向/目标，供 commit 时比较
+    rob.set_prediction(rob_idx, pred_taken, pred_target);
 
     // 7. 分配 LSQ 槽位（仅访存指令）
     if (is_load || is_store) {

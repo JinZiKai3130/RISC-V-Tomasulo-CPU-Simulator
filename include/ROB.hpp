@@ -9,9 +9,15 @@ struct ROBEntry {
   bool ready;     // 判断是否算完，等待commit，变化来自write_back操作
   uint32_t pc;
   bool is_branch_taken;
+  // ---- 分支预测相关 ----
+  bool pred_taken;    // 预测方向（issue 时写入）
+  uint32_t pred_target;   // 预测目标 PC
+  bool actual_taken;  // 实际方向（writeback 广播时写入）
+  uint32_t actual_target; // 实际目标 PC
   ROBEntry()
       : busy(0), op(0), dest_reg(0), value(0), ready(0), pc(0),
-        is_branch_taken(0) {}
+        is_branch_taken(0), pred_taken(0), pred_target(0), actual_taken(0),
+        actual_target(0) {}
 };
 class ROB {
   static const int ROB_SIZE = 8;
@@ -59,6 +65,12 @@ public:
   // 2. 写回：CDB 广播到来，填入结果
   void writeback(int rob_tag, uint32_t value);
 
+  // 2b. 写回：分支指令把实际方向/目标填入 ROB（供 commit 时比较预测）
+  void set_branch_actual(int rob_tag, bool taken, uint32_t target);
+
+  // 2c. 发射：把预测方向/目标存入 ROB（供 commit 时比较）
+  void set_prediction(int rob_tag, bool taken, uint32_t target);
+
   // 3. 检查队首是否就绪（用于提交判断）
   bool is_head_ready() const;
 
@@ -68,8 +80,8 @@ public:
   // 5. 提交队首（释放槽位，head 后移；寄存器/内存写入由 Simulator 完成）
   void commit_head();
 
-  // 6. 投机刷新：分支预测错误时，清空从给定 rob_tag 之后的所有年轻条目
-  void flush(int rob_tag);
+  // 6. 投机刷新：分支预测错误时，清空所有未提交条目（整体重来）
+  void flush();
 
   bool is_full() const { return cur_count == ROB_SIZE; }
   bool is_empty() const { return cur_count == 0; }
