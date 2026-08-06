@@ -24,6 +24,10 @@ private:
   bool cur_halted, next_halted;
   int cycle_count = 0;
 
+  // 本周期是否发生分支误预测重定向（update_all 的 MUX 仲裁用，每周期清零）
+  bool redirect_valid;
+  uint32_t redirect_pc;
+
   // 指令类别（与 ROB/RS 的 op 字段保持一致）
   enum { OP_ALU = 0, OP_BRANCH = 1, OP_STORE = 2, OP_LOAD = 3 };
 
@@ -42,9 +46,23 @@ private:
     // PC / halted 也需要快照：发射停顿（不更新 PC）时保持 next_pc = cur_pc
     next_pc = cur_pc;
     next_halted = cur_halted;
+    redirect_valid = false; // 每周期清零：本周期是否发生误预测重定向
   }
 
   void update_all() {
+    if (redirect_valid) {
+      // 分支误预测：整体刷新投机结构（含本周期 do_issue 发射的投机指令），
+      // 并把 PC 重定向到实际目标。flush 推迟到时钟沿统一执行，
+      // 与 do_issue 的先后顺序无关；这里用 MUX 仲裁：
+      // “误预测重定向”优先于 do_issue 的“取指提案”（next_pc）。
+      rob.flush();
+      rs.flush();
+      lsq.flush();
+      status.flush();
+      next_pc = redirect_pc;
+      next_halted = false; // 错误路径上取到的 halt 是推测的，必须复位
+      redirect_valid = false;
+    }
     for (int i = 0; i < REG_SIZE; i++) {
       cur_reg[i] = next_reg[i];
     }
@@ -105,18 +123,13 @@ private:
       bool mispred = (head->pred_taken != head->actual_taken) ||
                      (head->pred_target != head->actual_target);
       if (mispred) {
-        // 全部推翻重来：清空所有投机结构（ROB/RS/LSQ/RAT）。
-        // 已提交的寄存器/内存结果不受影响（分支在队首时比它老的都已提交），
-        // 从实际目标
-        // 重新取指。
-        // 注意：错误路径上可能已取到 halt（next_halted=true），它是推测的，
-        // 必须一并复位——halt 不进流水线，分支之后的 halt 一定是错误路径的。
-        next_halted = false;
-        rob.flush();
-        rs.flush();
-        lsq.flush();
-        status.flush();
-        next_pc = head->actual_target;
+        // 误预测：这里**不**直接写 next_pc / 不当场 flush——那会依赖
+        // do_issue 与 do_commit 的执行先后顺序。只记录重定向信息，
+        // 真正的 flush + PC 重定向统一在 update_all 的时钟沿用 MUX 完成
+        // （重定向优先于 do_issue 的取指提案）。
+        // 已提交的寄存器/内存结果不受影响（分支在队首时比它老的都已提交）。
+        redirect_valid = true;
+        redirect_pc = head->actual_target;
       } else {
         // 预测正确：正常提交
         rob.commit_head();
@@ -148,7 +161,7 @@ private:
 
     if (tag != -1) {
       // 广播副作用（全部写各部件 next）
-      rs.wakeup(tag, value);     // 唤醒 RS 依赖者（清 qj/qk）
+      rs.set_broadcast(tag, value); // 记录 CDB 广播（唤醒推迟到 update 的 MUX）
       rob.writeback(tag, value); // 填 ROB（load/ALU 写结果；分支暂记 link 值）
       // 注意：此处不再清 RAT。寄存器堆只在 commit 时更新，若广播时就清 RAT，
       // 则“已广播但未提交”期间发射的消费指令会读到寄存器旧值（如 s1=s0+16
@@ -451,11 +464,12 @@ public:
 
     // 2. 执行四个阶段（顺序可以任意打乱！）
     //    因为都读 cur、写 next，所以下面几行任意排列组合结果都一样。
-    do_issue();
-    do_execute();
-    lsq.step(memory); // 内存单元每周期推进（读 cur 写 next）
-    do_writeback();
     do_commit();
+    do_writeback();
+    do_issue();
+
+    lsq.step(memory); // 内存单元每周期推进（读 cur 写 next）
+    do_execute();
 
     // 3. 原子交换：所有 next 变为新的 cur，进入下一周期
     update_all();

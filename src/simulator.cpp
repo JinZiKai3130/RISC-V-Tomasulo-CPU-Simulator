@@ -5,7 +5,8 @@
 
 Simulator::Simulator()
     : cur_reg{}, next_reg{}, cur_pc(0), next_pc(0), cur_halted(false),
-      next_halted(false), cycle_count(0) {}
+      next_halted(false), cycle_count(0), redirect_valid(false),
+      redirect_pc(0) {}
 
 void Simulator::load_program() {
   std::string line;

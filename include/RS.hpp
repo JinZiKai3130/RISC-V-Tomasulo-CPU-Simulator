@@ -29,17 +29,44 @@ class ReservationStation {
 
   RS_Entry cur_rs[RS_SIZE];
   RS_Entry next_rs[RS_SIZE];
+  // 本周期 CDB 广播（MUX：推迟到 update 统一唤醒）。
+  // 解决 do_issue 与 do_writeback 的执行顺序依赖——新发射的消费指令
+  // 无论先发射还是后发射，只要与生产者广播同周期，都能被清掉 qj/qk。
+  bool next_cdb_valid;
+  int next_cdb_tag;
+  uint32_t next_cdb_value;
 
   int find_free_slot();
 
 public:
+  ReservationStation()
+      : next_cdb_valid(false), next_cdb_tag(-1), next_cdb_value(0) {}
+
   void take_snapshot() {
     for (int i = 0; i < RS_SIZE; i++) {
       next_rs[i] = cur_rs[i];
     }
+    next_cdb_valid = false; // 每周期清零：本周期是否发生 CDB 广播
   }
 
   void update() {
+    // CDB 广播 MUX：对最终 next_rs 统一唤醒，与各阶段执行顺序无关。
+    // 注意：qj 与 qk 可能指向同一个生产者标签（如 add x3,x2,x2），
+    // 必须用两个独立 if 而不是 else-if，否则只清一个、另一个死锁。
+    if (next_cdb_valid) {
+      for (int i = 0; i < RS_SIZE; i++) {
+        if (!next_rs[i].busy)
+          continue;
+        if (next_cdb_tag == next_rs[i].qj) {
+          next_rs[i].vj = (int)next_cdb_value;
+          next_rs[i].qj = -1;
+        }
+        if (next_cdb_tag == next_rs[i].qk) {
+          next_rs[i].vk = (int)next_cdb_value;
+          next_rs[i].qk = -1;
+        }
+      }
+    }
     for (int i = 0; i < RS_SIZE; i++) {
       cur_rs[i] = next_rs[i];
     }
@@ -62,8 +89,9 @@ public:
   // 仅锁定条目（访存指令：地址已算好，等待内存结果，写 next_rs）
   void lock(int idx);
 
-  // CDB 广播到来，唤醒等待该标签的条目（读 cur_rs，写 next_rs）
-  void wakeup(int producer_tag, int result_value);
+  // CDB 广播到来：只记录本周期广播（写 next_*），真正的唤醒推迟到
+  // update() 的 MUX 统一执行（见 update()）。
+  void set_broadcast(int producer_tag, uint32_t result_value);
 
   // 选择操作数就绪、未被锁定的条目用于执行（读 cur_rs）
   int select_ready(int &op, int &vj, int &vk, int &rob_tag);

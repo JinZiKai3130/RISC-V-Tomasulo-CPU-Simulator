@@ -46,24 +46,14 @@ void ReservationStation::set_branch(int idx, bool taken, int target,
 
 void ReservationStation::lock(int idx) { next_rs[idx].waiting = 1; }
 
-void ReservationStation::wakeup(int producer_tag, int result_value) {
-  // 在 next_rs 上操作：快照后 next 已包含本周期新发射的条目。
-  // 必须这样——如果某指令发射的同一周期其生产者正好广播，
-  // 该新条目（只在 next 中）的 qj/qk 才能被这次广播清除，避免死锁。
-  for (int i = 0; i < RS_SIZE; i++) {
-    if (!next_rs[i].busy)
-      continue;
-    // 注意：qj 与 qk 可能指向同一个生产者标签（如 add x3,x2,x2），
-    // 必须用两个独立 if 而不是 else-if，否则只清一个、另一个死锁。
-    if (producer_tag == next_rs[i].qj) {
-      next_rs[i].vj = result_value;
-      next_rs[i].qj = -1;
-    }
-    if (producer_tag == next_rs[i].qk) {
-      next_rs[i].vk = result_value;
-      next_rs[i].qk = -1;
-    }
-  }
+void ReservationStation::set_broadcast(int producer_tag,
+                                       uint32_t result_value) {
+  // 只记录本周期 CDB 广播，真正的唤醒在 update() 的时钟沿统一执行
+  // （MUX）。这样无论 do_issue（add）与 do_writeback（广播）谁先谁后，
+  // 新发射的消费指令都能被本周期广播清掉 qj/qk，避免死锁。
+  next_cdb_tag = producer_tag;
+  next_cdb_value = result_value;
+  next_cdb_valid = true;
 }
 
 int ReservationStation::select_ready(int &op, int &vj, int &vk, int &rob_tag) {
@@ -115,4 +105,5 @@ void ReservationStation::flush() {
   for (int i = 0; i < RS_SIZE; i++) {
     next_rs[i] = RS_Entry();
   }
+  next_cdb_valid = false; // 连同本周期广播一起作废
 }
