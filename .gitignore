@@ -11,3 +11,7 @@
 /.vscode
 simulator
 build/
+
+__pycache__/
+
+code

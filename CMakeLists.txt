@@ -10,7 +10,12 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
-add_executable(simulator
+# 可执行文件输出到项目根目录
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR})
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_RELEASE ${CMAKE_SOURCE_DIR})
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_DEBUG ${CMAKE_SOURCE_DIR})
+
+add_executable(code
   src/main.cpp
   src/simulator.cpp
   src/decode.cpp
@@ -19,9 +24,9 @@ add_executable(simulator
   src/RS.cpp
 )
 
-target_include_directories(simulator PRIVATE include)
+target_include_directories(code PRIVATE include)
 
 # 模拟器是 CPU 密集型程序，启用优化选项
-target_compile_options(simulator PRIVATE
+target_compile_options(code PRIVATE
   $<$<CONFIG:Release>:-O2>
 )

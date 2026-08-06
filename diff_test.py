@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-对拍脚本：用 data/ 下的每个测试数据分别运行 Tomasulo 模拟器（build/simulator）
+对拍脚本：用 data/ 下的每个测试数据分别运行 Tomasulo 模拟器（./code）
 与 naive 模拟器（build/naive），比较两者输出（寄存器 a0 的低 8 位）。
 
 用法：
   python3 diff_test.py               # 按需构建两个模拟器，然后对拍全部用例
-  python3 diff_test.py --no-build    # 不重新构建，直接用 build/ 下现有二进制
+  python3 diff_test.py --no-build    # 不重新构建，直接用现有二进制
   python3 diff_test.py --rebuild     # 强制重新构建
   python3 diff_test.py -t gcd expr   # 只对拍指定用例（不带 .data 后缀）
 
@@ -20,7 +20,7 @@ import sys
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 BUILD = os.path.join(ROOT, "build")
-SIM_BIN = os.path.join(BUILD, "simulator")
+SIM_BIN = os.path.join(ROOT, "code")
 NAIVE_BIN = os.path.join(BUILD, "naive")
 NAIVE_SRC = os.path.join(ROOT, "naive_simulator.cpp")
 
@@ -59,10 +59,10 @@ def build(force=False):
             check=True,
         )
 
-    # 2. simulator：走 CMake（在 build/ 目录里）
+    # 2. simulator：走 CMake，可执行文件输出到项目根目录（./code）
     if force or not os.path.exists(SIM_BIN) or \
             os.path.getmtime(SIM_BIN) < newest_mtime(SIM_SOURCES):
-        print("[build] cmake --build build (simulator)")
+        print("[build] cmake --build build -> ./code")
         subprocess.run(["cmake", "--build", BUILD], check=True)
 
 
