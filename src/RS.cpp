@@ -25,7 +25,7 @@ void ReservationStation::add(int op, int rob_tag, const DecodedInst &dec,
   modified.qk = qk;
   modified.vj = vj;
   modified.vk = vk;
-  modified.waiting = 0; // 新条目默认等待执行
+  modified.waiting = 0;
   modified.result = 0;
   modified.branch_taken = 0;
   modified.branch_target = 0;
@@ -48,16 +48,12 @@ void ReservationStation::lock(int idx) { next_rs[idx].waiting = 1; }
 
 void ReservationStation::set_broadcast(int producer_tag,
                                        uint32_t result_value) {
-  // 只记录本周期 CDB 广播，真正的唤醒在 update() 的时钟沿统一执行
-  // （MUX）。这样无论 do_issue（add）与 do_writeback（广播）谁先谁后，
-  // 新发射的消费指令都能被本周期广播清掉 qj/qk，避免死锁。
   next_cdb_tag = producer_tag;
   next_cdb_value = result_value;
   next_cdb_valid = true;
 }
 
 int ReservationStation::select_ready(int &op, int &vj, int &vk, int &rob_tag) {
-  // 找到接下来的操作对象（可以用于ALU）
   for (int i = 0; i < RS_SIZE; i++) {
     if (!cur_rs[i].busy)
       continue;
@@ -73,8 +69,6 @@ int ReservationStation::select_ready(int &op, int &vj, int &vk, int &rob_tag) {
 }
 
 int ReservationStation::select_waiting(int &rob_tag, int &result) {
-  // 选一个"已算完（waiting）"的 ALU(0)/Branch(1) 条目等待 CDB 广播。
-  // 注意：Load(3)/Store(2) 的结果由 LSQ 提供，不经过这里广播。
   for (int i = 0; i < RS_SIZE; i++) {
     if (!cur_rs[i].busy)
       continue;
@@ -105,5 +99,5 @@ void ReservationStation::flush() {
   for (int i = 0; i < RS_SIZE; i++) {
     next_rs[i] = RS_Entry();
   }
-  next_cdb_valid = false; // 连同本周期广播一起作废
+  next_cdb_valid = false;
 }

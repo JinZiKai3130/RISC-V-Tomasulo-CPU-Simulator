@@ -8,75 +8,65 @@
 #include <cstdint>
 class Simulator {
 private:
-  // ---------- 所有结构都持有 cur 和 next ----------
-  static const int REG_SIZE = 32; // RV32I 共 32 个寄存器
-  uint32_t cur_reg[REG_SIZE];     // 内部包含 cur_regs[32], next_regs[32]
+  static const int REG_SIZE = 32; // 32 个寄存器
+  uint32_t cur_reg[REG_SIZE];
   uint32_t next_reg[REG_SIZE];
-  RegisterStatusTable status; // 内部包含 cur_table[32], next_table[32]
+  RegisterStatusTable status;
 
   ReservationStation rs;
 
-  ROB rob;            // 内部包含 cur_entries, next_entries
-  LoadStoreQueue lsq; // 内部包含 cur_entries, next_entries
+  ROB rob;
+  LoadStoreQueue lsq;
 
   Memory memory;
   uint32_t cur_pc, next_pc;
   bool cur_halted, next_halted;
   int cycle_count = 0;
 
-  // 本周期是否发生分支误预测重定向（update_all 的 MUX 仲裁用，每周期清零）
   bool redirect_valid;
   uint32_t redirect_pc;
 
-  // 指令类别（与 ROB/RS 的 op 字段保持一致）
   enum { OP_ALU = 0, OP_BRANCH = 1, OP_STORE = 2, OP_LOAD = 3 };
 
-  // ---------- 辅助函数：周期开始时快照，周期结束时交换 ----------
   void snapshot_all() {
-    // 将当前的 cur 拷贝到 next，作为本周期修改的起点
-    // 注意：不能用 swap，因为 swap 会丢失下一周期的初始状态
+    // 这里将当前状态全部在next里面记录一边
     for (int i = 0; i < REG_SIZE; i++) {
       next_reg[i] = cur_reg[i];
     }
-    next_reg[0] = 0;        // x0 恒为 0
-    status.take_snapshot(); // next = cur
-    rs.take_snapshot();     // next = cur
-    rob.take_snapshot();    // next = cur
-    lsq.take_snapshot();    // next = cur
-    // PC / halted 也需要快照：发射停顿（不更新 PC）时保持 next_pc = cur_pc
+    next_reg[0] = 0;
+    status.take_snapshot();
+    rs.take_snapshot();
+    rob.take_snapshot();
+    lsq.take_snapshot();
     next_pc = cur_pc;
     next_halted = cur_halted;
-    redirect_valid = false; // 每周期清零：本周期是否发生误预测重定向
+    redirect_valid = false;
   }
 
   void update_all() {
     if (redirect_valid) {
-      // 分支误预测：整体刷新投机结构（含本周期 do_issue 发射的投机指令），
-      // 并把 PC 重定向到实际目标。flush 推迟到时钟沿统一执行，
-      // 与 do_issue 的先后顺序无关；这里用 MUX 仲裁：
-      // “误预测重定向”优先于 do_issue 的“取指提案”（next_pc）。
+      // 如果出现了预测错误
       rob.flush();
       rs.flush();
       lsq.flush();
       status.flush();
       next_pc = redirect_pc;
-      next_halted = false; // 错误路径上取到的 halt 是推测的，必须复位
+      next_halted = false;
       redirect_valid = false;
     }
     for (int i = 0; i < REG_SIZE; i++) {
       cur_reg[i] = next_reg[i];
     }
-    status.update(); // cur = next
-    rs.update();     // cur = next
-    rob.update();    // cur = next
-    lsq.update();    // cur = next
+    status.update();
+    rs.update();
+    rob.update();
+    lsq.update();
     cur_pc = next_pc;
     cur_halted = next_halted;
   }
 
-  // ---------- 各个阶段（全部读取 cur，全部写入 next） ----------
   void do_commit() {
-    // 队首未就绪 / ROB 空：无法提交
+    // 无法提交
     if (rob.is_empty() || !rob.is_head_ready())
       return;
 
@@ -85,53 +75,44 @@ private:
 
     switch (head->op) {
     case OP_ALU: {
-      // 写寄存器（ROB.value 来自 CDB 广播）
       if (head->dest_reg != 0)
         next_reg[head->dest_reg] = head->value;
-      status.clear_if_match(head_tag); // 提交后才清 RAT（寄存器已更新）
+      status.clear_if_match(head_tag);
       rob.commit_head();
       break;
     }
     case OP_LOAD: {
-      // 写寄存器 + 释放 LSQ 队首 + 释放 ROB 队首
       if (lsq.commit_head()) {
         if (head->dest_reg != 0)
           next_reg[head->dest_reg] = head->value;
-        status.clear_if_match(head_tag); // 提交后才清 RAT（寄存器已更新）
+        status.clear_if_match(head_tag);
         rob.commit_head();
       }
       break;
     }
     case OP_STORE: {
-      // 队首 store 提交：此刻才正式启动内存写（投机期不碰内存）。
-      // 写完成后 LSQ 条目保留（write_done）直到本处随 ROB 一起释放，
-      // 保证 LSQ 队首始终与 ROB 队首同步，避免提交死锁。
-      lsq.start_commit_head();        // 未启动则标记 committed（排队写内存）
-      if (lsq.is_head_write_done()) { // 本周期（或此前）写完成
-        lsq.commit_store_head();      // 释放 LSQ 队首
-        rob.commit_head();            // 提交 ROB 队首
+      // 这里lsq进入commit进程，如果commit好了就从lsq中删掉，和rob一起去掉
+      lsq.start_commit_head();
+      if (lsq.is_head_write_done()) {
+        lsq.commit_store_head();
+        rob.commit_head();
       }
       break;
     }
     case OP_BRANCH: {
-      // 1. jal/jalr 写链接寄存器（pc+4，确定结果，与预测无关；条件分支 dest=-1
-      // 跳过）
+      // 无预测跳转
       if (head->dest_reg > 0)
         next_reg[head->dest_reg] = head->value;
-      status.clear_if_match(head_tag); // 提交后才清 RAT（寄存器已更新）
-      // 2. 比较预测 vs 实际：方向或目标任一不同 → 预测错误
+      status.clear_if_match(head_tag);
+
+      // 预测错误
       bool mispred = (head->pred_taken != head->actual_taken) ||
                      (head->pred_target != head->actual_target);
       if (mispred) {
-        // 误预测：这里**不**直接写 next_pc / 不当场 flush——那会依赖
-        // do_issue 与 do_commit 的执行先后顺序。只记录重定向信息，
-        // 真正的 flush + PC 重定向统一在 update_all 的时钟沿用 MUX 完成
-        // （重定向优先于 do_issue 的取指提案）。
-        // 已提交的寄存器/内存结果不受影响（分支在队首时比它老的都已提交）。
         redirect_valid = true;
         redirect_pc = head->actual_target;
       } else {
-        // 预测正确：正常提交
+        // 预测正确
         rob.commit_head();
       }
       break;
@@ -143,32 +124,27 @@ private:
   }
 
   void do_writeback() {
-    // ---- 1. CDB 广播：Load 完成优先于 ALU/Branch（仲裁）----
     int tag = -1;
     uint32_t value = 0;
     int lsq_idx = lsq.find_done_load();
     int rs_idx = -1;
 
+    // 如果有lsq的load完成，则先完成lsq
     if (lsq_idx != -1) {
       tag = lsq.get_rob_index(lsq_idx);
       value = lsq.get_value(lsq_idx);
     } else {
-      // ALU / 分支结果广播（值来自 RS）
       int result_int = 0;
       rs_idx = rs.select_waiting(tag, result_int);
       value = (uint32_t)result_int;
     }
 
     if (tag != -1) {
-      // 广播副作用（全部写各部件 next）
-      rs.set_broadcast(tag, value); // 记录 CDB 广播（唤醒推迟到 update 的 MUX）
-      rob.writeback(tag, value); // 填 ROB（load/ALU 写结果；分支暂记 link 值）
-      // 注意：此处不再清 RAT。寄存器堆只在 commit 时更新，若广播时就清 RAT，
-      // 则“已广播但未提交”期间发射的消费指令会读到寄存器旧值（如 s1=s0+16
-      // 读到了未提交的旧 s0）。RAT 条目在 do_commit 提交时统一清除。
-      lsq.set_data_by_rob(tag, value); // store 的数据到达
+      // 这里统一不更新RS和RAT，确保不会出现两个操作冲突
+      rs.set_broadcast(tag, value);
+      rob.writeback(tag, value);
+      lsq.set_data_by_rob(tag, value);
 
-      // 分支：把实际方向/目标写入 ROB（供 commit 时比较预测）
       if (rs_idx != -1 && rs.peek(rs_idx).op == OP_BRANCH) {
         const RS_Entry &e = rs.peek(rs_idx);
         rob.set_branch_actual(tag, e.branch_taken, (uint32_t)e.branch_target);
@@ -176,19 +152,16 @@ private:
 
       if (lsq_idx != -1) {
         lsq.mark_broadcasted(lsq_idx);
-        rs_idx = rs.find_by_rob(tag); // 释放 load 的 RS 槽位
+        rs_idx = rs.find_by_rob(tag);
       }
       if (rs_idx != -1)
         rs.release(rs_idx);
     }
 
-    // ---- 2. store 地址+数据就绪 → 通知 ROB（标 ready）、释放其 RS ----
-    // store 不再做投机期假访问：就绪即可通知 ROB；真正的内存写在提交
-    // 启动（lsq.start_commit_head）后由 LSQ::step() 串行执行。
     int st_idx = lsq.find_ready_store();
     if (st_idx != -1) {
       int st_tag = lsq.get_rob_index(st_idx);
-      rob.writeback(st_tag, 0); // store 无结果值，仅标 ready
+      rob.writeback(st_tag, 0);
       lsq.mark_broadcasted(st_idx);
       int rsidx = rs.find_by_rob(st_tag);
       if (rsidx != -1)
@@ -196,13 +169,11 @@ private:
     }
   }
 
-  // ---------- 复用 naive_simulator 中的计算逻辑 ----------
-  // naive 里是 regs[rs1]/regs[rs2]，这里换成 RS 条目的 vj/vk（就绪的操作数值）
   static int compute_alu(const RS_Entry &e, int vj, int vk) {
     uint32_t a = (uint32_t)vj;
     uint32_t b = (uint32_t)vk;
     switch (e.opcode) {
-    case 0x13: // I 型（含 I* 移位）
+    case 0x13:
       switch (e.funct3) {
       case 0x0:
         return (int)(a + (uint32_t)e.imm); // addi
@@ -261,7 +232,6 @@ private:
     return 0;
   }
 
-  // 分支条件判断（同 naive 的 0x63 分支逻辑）
   static bool eval_branch(const RS_Entry &e, int vj, int vk) {
     switch (e.funct3) {
     case 0x0:
@@ -280,32 +250,23 @@ private:
     return false;
   }
 
-  // ---------- 执行 ----------
-  // 从 RS.cur 选一条操作数就绪、未被锁定的指令，计算结果写入 RS.next /
-  // LSQ.next。 本阶段**不做 CDB 广播**：广播统一由 do_writeback
-  // 阶段完成（见下方说明）。
   void do_execute() {
-    // 1. 选择可执行条目（qj/qk 就绪且未被锁定）
     int op, vj, vk, rob_tag;
     int idx = rs.select_ready(op, vj, vk, rob_tag);
     if (idx == -1)
-      return; // 本周期没有可执行的指令
+      return;
 
-    // 2. 读取该条目执行所需的信息（imm/pc/opcode/funct 等）
     const RS_Entry &e = rs.peek(idx);
-
     switch (op) {
     case OP_ALU: {
-      // 算好 ALU 结果，写入 RS.next 并标记"已算完，等待 CDB 广播"
       rs.set_result(idx, compute_alu(e, vj, vk));
       break;
     }
     case OP_BRANCH: {
-      // 分支/跳转：算出实际方向与目标（预测留到后续阶段处理）
       bool taken;
       int target;
-      int link = 0;           // jal/jalr 写入 rd 的值（pc+4）
-      if (e.opcode == 0x63) { // 条件分支
+      int link = 0;
+      if (e.opcode == 0x63) {
         taken = eval_branch(e, vj, vk);
         target = taken ? (int)(e.pc + e.imm) : (int)(e.pc + 4);
       } else if (e.opcode == 0x6f) { // jal
@@ -322,14 +283,11 @@ private:
     }
     case OP_LOAD:
     case OP_STORE: {
-      // 访存：算地址填入 LSQ.next（内存访问由 LSQ 按延迟进行）
       uint32_t addr = (uint32_t)(vj + e.imm);
       lsq.set_addr_by_rob(rob_tag, addr);
       if (op == OP_STORE) {
-        // select_ready 要求 qk 就绪，故 store 的数据此时一定已就绪
         lsq.set_data_by_rob(rob_tag, (uint32_t)vk);
       }
-      // 锁定条目（waiting），防止再次被 select_ready 选中
       rs.lock(idx);
       break;
     }
@@ -338,29 +296,20 @@ private:
     }
   }
 
-  // ---------- 发射（含取指） ----------
-  // 本设计没有独立的取指缓冲：每个周期在发射阶段取一条指令并尝试发射。
-  // 全部读取 cur_*，全部写入 next_*。
   void do_issue() {
-    // 已停机：不再取指
     if (cur_halted)
       return;
-
-    // 1. 取指并解码
     uint32_t inst = memory.read_word(cur_pc);
     DecodedInst dec(inst);
-
-    // 2. 终止条件：遇到 li a0, 255 (0x0ff00513) 时不执行，直接停机
     if (inst == 0x0ff00513u) {
       next_halted = true;
       return;
     }
 
-    // 3. 判定指令类别（决定 op_type 与资源需求）
-    bool is_load = (dec.opcode == 0x03);   // lb/lh/lw/lbu/lhu
-    bool is_store = (dec.opcode == 0x23);  // sb/sh/sw
-    bool is_branch = (dec.opcode == 0x63); // beq/bne/blt/bge/...
-    bool is_jump = (dec.opcode == 0x6f || dec.opcode == 0x67); // jal / jalr
+    bool is_load = (dec.opcode == 0x03);
+    bool is_store = (dec.opcode == 0x23);
+    bool is_branch = (dec.opcode == 0x63);
+    bool is_jump = (dec.opcode == 0x6f || dec.opcode == 0x67);
 
     uint8_t op_type;
     if (is_branch || is_jump)
@@ -370,55 +319,41 @@ private:
     else if (is_load)
       op_type = OP_LOAD;
     else
-      op_type = OP_ALU; // R 型 / I 型 ALU / lui / auipc
+      op_type = OP_ALU;
 
-    // 4. 资源检查：任一结构满则停顿（PC 不动，next_pc 保持 cur_pc）
     if (rob.is_full() || rs.is_full())
       return;
     if ((is_load || is_store) && lsq.is_full())
       return;
 
-    // 5. 分支预测：统一预测"不跳转"（即顺序执行下一条 pc+4）。
-    //    之后接入 Predictor 时，用预测器输出替换 pred_taken / pred_target。
-    //    预测方向/目标会存入 ROB，commit 时与实际结果比较。
     bool pred_taken = false;
     uint32_t pred_target = cur_pc + 4;
 
-    // 6. 分配 ROB 槽位（条件分支不写寄存器；jump 写 link 值；store 不写）
     bool writes_reg = !is_branch && !is_store;
     int dest_reg = writes_reg ? (int)dec.rd : -1;
     int rob_idx = rob.allocate(op_type, dest_reg, cur_pc);
-    // 记录预测方向/目标，供 commit 时比较
     rob.set_prediction(rob_idx, pred_taken, pred_target);
 
-    // 7. 分配 LSQ 槽位（仅访存指令）
     if (is_load || is_store) {
       lsq.allocate(is_store, rob_idx, dec.funct3);
     }
 
-    // 8. 判定真正的源寄存器
-    //    注意：decode 里 I/S/B/J 型指令的 rs2/rd 字段被复用为立即数的一部分，
-    //    只有真正携带寄存器号的字段才能用于查状态表 / 读寄存器堆
     bool has_rs1 = true, has_rs2 = false;
     switch (dec.opcode) {
-    case 0x33: // R 型：rs1 + rs2
-    case 0x63: // B 型（branch）：rs1 + rs2
-    case 0x23: // S 型（store）：rs1(基址) + rs2(数据)
+    case 0x33:
+    case 0x63:
+    case 0x23:
       has_rs2 = true;
       break;
-    case 0x6f: // JAL：无源寄存器
-    case 0x37: // LUI
-    case 0x17: // AUIPC
+    case 0x6f:
+    case 0x37:
+    case 0x17:
       has_rs1 = false;
       break;
-    default: // I 型（ALU / load / jalr）：仅 rs1
+    default:
       break;
     }
 
-    // 9. 读取源操作数：
-    //    RAT 中有生产者标签 → 若该 ROB 条目已广播(ready)则直接从 ROB 读结果
-    //    （生产者已算完、仅等 commit，CDB 不会再广播，必须在此取值）；
-    //    否则置 q=tag 等待 CDB 广播。无生产者标签 → 直接读寄存器堆。
     int qj = has_rs1 ? status.get_producer(dec.rs1) : -1;
     int qk = has_rs2 ? status.get_producer(dec.rs2) : -1;
     int vj = 0, vk = 0;
@@ -439,16 +374,12 @@ private:
       }
     }
 
-    // 10. 分配 RS 槽位（所有指令都占用：ALU/分支算结果，访存算地址）
-    //     同时拷贝执行所需的 dec/pc 信息（opcode/funct3/funct7/imm/pc）
     rs.add(op_type, rob_idx, dec, cur_pc, vj, vk, qj, qk);
 
-    // 11. 更新 RAT：目的寄存器映射到本指令的 ROB 标签
     if (writes_reg && dec.rd != 0) {
       status.set_producer(dec.rd, rob_idx);
     }
 
-    // 12. 更新 PC（预测目标；暂按顺序 +4）
     next_pc = pred_target;
   }
 
@@ -457,31 +388,23 @@ public:
 
   void load_program();
 
-  // 运行一个时钟周期
   void tick() {
-    // 1. 快照：将当前 cur 拷贝到 next（确定本周期的输入边界）
     snapshot_all();
 
-    // 2. 执行四个阶段（顺序可以任意打乱！）
-    //    因为都读 cur、写 next，所以下面几行任意排列组合结果都一样。
     do_commit();
     do_writeback();
     do_issue();
 
-    lsq.step(memory); // 内存单元每周期推进（读 cur 写 next）
+    lsq.step(memory);
     do_execute();
 
-    // 3. 原子交换：所有 next 变为新的 cur，进入下一周期
     update_all();
 
     cycle_count++;
   }
 
-  // 停机判定：已取到 halt 指令（cur_halted，停止取指）且流水线排空（ROB 空）。
-  // 乱序执行下必须等所有指令提交完，a0 才是最终值。
   bool is_halted() const { return cur_halted && rob.is_empty(); }
 
-  // 程序返回值：a0(x10) 的低 8 位
   uint32_t get_result() const { return cur_reg[10] & 0xff; }
 
   int get_cycle_count() const { return cycle_count; }

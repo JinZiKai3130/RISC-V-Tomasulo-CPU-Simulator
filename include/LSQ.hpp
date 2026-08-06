@@ -5,17 +5,17 @@
 struct LSQEntry {
   bool occupied;
   bool is_store;
-  uint32_t funct3; // 访存宽度/符号（lb/lh/lw/lbu/lhu 与 sb/sh/sw）
+  uint32_t funct3;
   uint32_t addr;
   bool addr_ready;
-  uint32_t value;  // Load 读回的值 或 Store 要写的值
-  bool data_ready; // Store: 数据已就绪; Load: 值已就绪（内存访问完成读回）
+  uint32_t value;  // load存储读出来的值，store存储写入的值
+  bool data_ready; // load已读出，store写入值准备就绪
   uint32_t rob_index;
-  bool rob_ready; // load: 内存读完成（可广播）。store 不使用（无投机期假访问）
-  bool broadcasted; // 完成状态已通知 ROB（load: 已广播; store: ROB 已标 ready）
-  bool committed;   // store: 已从 ROB 提交、等待/正在写内存（投机 store
-                    // 不占内存单元）
-  bool write_done;  // store: 写内存已完成（等待 ROB 提交后才释放本槽位）
+  bool rob_ready; // load已读出 等待广播
+  bool
+      broadcasted; // load表示已经广播，store表示ready了，等待到达队头执行写入memory
+  bool committed;  // store到达ROB队首，可以进行写入memory操作
+  bool write_done; // store写内存已完成
   LSQEntry()
       : occupied(false), is_store(false), funct3(0), addr(0), addr_ready(false),
         value(0), data_ready(false), rob_index(0), rob_ready(false),
@@ -29,11 +29,11 @@ private:
   LSQEntry next_entries[SIZE];
   int cur_head;
   int cur_tail;
-  int cur_count;      // 当前有效条目数
-  int next_issued;    // 本周期发射（enqueue）增量
-  int next_committed; // 本周期提交（dequeue）增量
+  int cur_count;
+  int next_issued;
+  int next_committed;
   int cur_left_cycle;
-  int cur_mem_execute_idx;
+  int cur_mem_execute_idx; // 当前正在修改的idx
   int next_left_cycle;
   int next_mem_execute_idx;
 
@@ -60,7 +60,6 @@ public:
     for (int i = 0; i < SIZE; i++) {
       cur_entries[i] = next_entries[i];
     }
-    // 同一周期内发射与提交可同时发生：增量汇总
     cur_head = advance_n(cur_head, next_committed);
     cur_tail = advance_n(cur_tail, next_issued);
     cur_count = cur_count + next_issued - next_committed;
@@ -84,7 +83,6 @@ public:
   }
 
   void set_addr_by_rob(int rob_tag, uint32_t address) {
-    // 由于CDB更新RS1，可以计算新的地址了，从ROB传过来
     int idx = find_by_rob(rob_tag);
     if (idx != -1) {
       next_entries[idx].addr = address;
@@ -93,7 +91,6 @@ public:
   }
 
   void set_data_by_rob(int rob_tag, uint32_t data) {
-    // 这里是由于CDB广播的更新，而产生的更新操作，从ROB传来
     int idx = find_by_rob(rob_tag);
     if (idx != -1) {
       next_entries[idx].value = data;
@@ -101,27 +98,17 @@ public:
     }
   }
 
-  // ---- 每周期推进内存单元（串行：同一时刻最多一条访存，读 cur 写 next）----
   void step(Memory &mem) {
-    // 1. 内存单元忙：倒计时
     if (cur_left_cycle > 0) {
       next_left_cycle = cur_left_cycle - 1;
       if (cur_left_cycle == 1) {
-        // 本次访问完成
         int idx = cur_mem_execute_idx;
         if (idx >= 0 && idx < SIZE && cur_entries[idx].occupied) {
           if (cur_entries[idx].is_store) {
-            // store 写完成：此刻才真正写内存（已从 ROB 提交、不再投机）。
-            // 注意：写完成后**不释放槽位**，只置 write_done。
-            // 槽位要等 ROB 队首提交（do_commit 调用 commit_store_head）
-            // 才释放，保证 LSQ 队首始终与 ROB 队首的 store 同步，
-            // 避免“ROB 队首 store 已不在 LSQ”导致的提交死锁。
             write_mem(mem, cur_entries[idx].addr, cur_entries[idx].value,
                       cur_entries[idx].funct3);
             next_entries[idx].write_done = true;
           } else {
-            // load：启动时已保证所有更老 store 都写完（真正写进内存），
-            // 因此直接读内存即可。
             uint32_t addr = cur_entries[idx].addr;
             next_entries[idx].value =
                 read_mem(mem, addr, cur_entries[idx].funct3);
@@ -133,7 +120,6 @@ public:
       }
       return;
     }
-    // 2. 内存单元空闲：启动一条就绪的访存
     int idx = select_mem_ready();
     if (idx == -1)
       return;
@@ -141,7 +127,6 @@ public:
     next_mem_execute_idx = idx;
   }
 
-  // 找一个"内存访问完成、等待 CDB 广播"的 load（返回下标，无则 -1）
   int find_done_load() {
     int idx = cur_head;
     for (int i = 0; i < cur_count; i++) {
@@ -153,9 +138,6 @@ public:
     return -1;
   }
 
-  // 找一个"地址+数据已就绪、等待通知 ROB"的 store（返回下标，无则 -1）。
-  // store 不再做投机期假访问：地址数据算好即可通知 ROB（标 ready），
-  // 真正的内存写在提交启动（start_commit_head）后由 step() 执行。
   int find_ready_store() {
     int idx = cur_head;
     for (int i = 0; i < cur_count; i++) {
@@ -168,28 +150,24 @@ public:
     return -1;
   }
 
-  // 访问器（供 do_writeback 使用）
   int get_rob_index(int idx) const { return cur_entries[idx].rob_index; }
   uint32_t get_value(int idx) const { return cur_entries[idx].value; }
   void mark_broadcasted(int idx) { next_entries[idx].broadcasted = true; }
 
-  // 队首提交：仅用于 load（读已完成则释放槽位）。
-  // store 的写内存由 step() 完成，写完后由 commit_store_head 随 ROB 一起释放。
   bool commit_head() {
+    // 这里用来commit关于load的东西
     if (cur_count == 0)
       return false;
     auto &e = cur_entries[cur_head];
     if (e.is_store)
-      return false; // store 不走这里
+      return false;
     if (!(e.addr_ready && e.data_ready))
       return false;
-    next_entries[cur_head] = LSQEntry(); // 释放队首
+    next_entries[cur_head] = LSQEntry();
     next_committed++;
     return true;
   }
 
-  // 队首 store 是否已写完内存（供 do_commit 决定是否提交 ROB 队首）。
-  // 写完成后条目保留在 LSQ（write_done），等这里随 ROB 一起释放。
   bool is_head_write_done() const {
     if (cur_count == 0)
       return false;
@@ -197,20 +175,17 @@ public:
     return e.occupied && e.is_store && e.write_done;
   }
 
-  // 释放队首 store 槽位（仅在 ROB 队首 store 提交时调用，与 ROB 同步）。
   void commit_store_head() {
+    // commit store
     if (cur_count == 0)
       return;
     auto &e = cur_entries[cur_head];
     if (!e.occupied || !e.is_store || !e.write_done)
       return;
-    next_entries[cur_head] = LSQEntry(); // 释放队首
+    next_entries[cur_head] = LSQEntry();
     next_committed++;
   }
 
-  // store 提交启动：队首 store 已就绪且未启动 → 标记
-  // committed（开始排队写内存）。 返回 true 表示本周期启动成功；之后的写由
-  // step() 串行执行 3 周期。
   bool start_commit_head() {
     if (cur_count == 0)
       return false;
@@ -249,18 +224,16 @@ private:
   }
 
   int select_mem_ready() {
-    // 从队首开始找最老的一条"可开始访存"的条目（跳过未就绪者，避免死锁）
+    // 从队首开始找可以进行内存读写操作的指令
     int idx = cur_head;
     for (int i = 0; i < cur_count; i++) {
       if (cur_entries[idx].occupied) {
         if (cur_entries[idx].is_store) {
-          // 只有"已从 ROB 提交"且未写完的 store 才真正写内存；
-          // 投机期的 store 不碰内存、不占内存单元；写完的不重复写。
+          // 已经commit即store_start了，但是还没写完
           if (cur_entries[idx].committed && !cur_entries[idx].write_done)
             return idx;
         } else {
-          // load：必须等所有更老的 store 都写完（提交并真正写进内存）才能读，
-          // 这样直接读内存即可，无需转发。
+          // 如果要做load确保所有的store已经写完了
           if (cur_entries[idx].addr_ready && !cur_entries[idx].rob_ready &&
               !has_older_unfinished_store(idx))
             return idx;
@@ -271,8 +244,6 @@ private:
     return -1;
   }
 
-  // load_idx 之前（更老）是否还有未完成写的 store。
-  // 未提交的投机 store 与已提交但写未完成的 store 都仍在 LSQ 中，都算。
   bool has_older_unfinished_store(int load_idx) {
     int idx = cur_head;
     for (int i = 0; i < cur_count; i++) {
@@ -285,7 +256,6 @@ private:
     return false;
   }
 
-  // 按宽度/符号读内存（对应 naive 的 load 逻辑）
   uint32_t read_mem(Memory &mem, uint32_t addr, uint32_t funct3) {
     switch (funct3) {
     case 0x0: // lb
@@ -303,7 +273,6 @@ private:
     return 0;
   }
 
-  // 按宽度写内存（对应 naive 的 store 逻辑）
   void write_mem(Memory &mem, uint32_t addr, uint32_t value, uint32_t funct3) {
     switch (funct3) {
     case 0x0: // sb
