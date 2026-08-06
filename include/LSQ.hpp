@@ -15,10 +15,11 @@ struct LSQEntry {
   bool broadcasted; // 完成状态已通知 ROB（load: 已广播; store: ROB 已标 ready）
   bool committed;   // store: 已从 ROB 提交、等待/正在写内存（投机 store
                     // 不占内存单元）
+  bool write_done;  // store: 写内存已完成（等待 ROB 提交后才释放本槽位）
   LSQEntry()
       : occupied(false), is_store(false), funct3(0), addr(0), addr_ready(false),
         value(0), data_ready(false), rob_index(0), rob_ready(false),
-        broadcasted(false), committed(false) {}
+        broadcasted(false), committed(false), write_done(false) {}
 };
 
 class LoadStoreQueue {
@@ -35,18 +36,15 @@ private:
   int cur_mem_execute_idx;
   int next_left_cycle;
   int next_mem_execute_idx;
-  bool cur_store_finished; // 本周期是否有 store 写完成（供 do_commit 提交 ROB）
-  bool next_store_finished;
 
-  int advance(int idx) { return (idx + 1) % SIZE; }
-  int advance_n(int idx, int n) { return (idx + n) % SIZE; }
+  int advance(int idx) const { return (idx + 1) % SIZE; }
+  int advance_n(int idx, int n) const { return (idx + n) % SIZE; }
 
 public:
   LoadStoreQueue()
       : cur_head(0), cur_tail(0), cur_count(0), next_issued(0),
         next_committed(0), cur_left_cycle(0), cur_mem_execute_idx(-1),
-        next_left_cycle(0), next_mem_execute_idx(-1), cur_store_finished(false),
-        next_store_finished(false) {}
+        next_left_cycle(0), next_mem_execute_idx(-1) {}
 
   void take_snapshot() {
     for (int i = 0; i < SIZE; i++) {
@@ -56,7 +54,6 @@ public:
     next_committed = 0;
     next_left_cycle = cur_left_cycle;
     next_mem_execute_idx = cur_mem_execute_idx;
-    next_store_finished = false; // 每周期清零，只记录"本周期新完成"的 store 写
   }
 
   void update() {
@@ -69,7 +66,6 @@ public:
     cur_count = cur_count + next_issued - next_committed;
     cur_left_cycle = next_left_cycle;
     cur_mem_execute_idx = next_mem_execute_idx;
-    cur_store_finished = next_store_finished;
   }
 
   bool is_full() const { return cur_count == SIZE; }
@@ -115,13 +111,14 @@ public:
         int idx = cur_mem_execute_idx;
         if (idx >= 0 && idx < SIZE && cur_entries[idx].occupied) {
           if (cur_entries[idx].is_store) {
-            // store 写完成：此刻才真正写内存（已从 ROB 提交、不再投机），
-            // 释放槽位并通知 do_commit 提交 ROB。
+            // store 写完成：此刻才真正写内存（已从 ROB 提交、不再投机）。
+            // 注意：写完成后**不释放槽位**，只置 write_done。
+            // 槽位要等 ROB 队首提交（do_commit 调用 commit_store_head）
+            // 才释放，保证 LSQ 队首始终与 ROB 队首的 store 同步，
+            // 避免“ROB 队首 store 已不在 LSQ”导致的提交死锁。
             write_mem(mem, cur_entries[idx].addr, cur_entries[idx].value,
                       cur_entries[idx].funct3);
-            next_entries[idx] = LSQEntry();
-            next_committed++;
-            next_store_finished = true;
+            next_entries[idx].write_done = true;
           } else {
             // load：启动时已保证所有更老 store 都写完（真正写进内存），
             // 因此直接读内存即可。
@@ -177,7 +174,7 @@ public:
   void mark_broadcasted(int idx) { next_entries[idx].broadcasted = true; }
 
   // 队首提交：仅用于 load（读已完成则释放槽位）。
-  // store 的写内存与释放由 step() 完成（启动见 start_commit_head）。
+  // store 的写内存由 step() 完成，写完后由 commit_store_head 随 ROB 一起释放。
   bool commit_head() {
     if (cur_count == 0)
       return false;
@@ -189,6 +186,26 @@ public:
     next_entries[cur_head] = LSQEntry(); // 释放队首
     next_committed++;
     return true;
+  }
+
+  // 队首 store 是否已写完内存（供 do_commit 决定是否提交 ROB 队首）。
+  // 写完成后条目保留在 LSQ（write_done），等这里随 ROB 一起释放。
+  bool is_head_write_done() const {
+    if (cur_count == 0)
+      return false;
+    auto &e = cur_entries[cur_head];
+    return e.occupied && e.is_store && e.write_done;
+  }
+
+  // 释放队首 store 槽位（仅在 ROB 队首 store 提交时调用，与 ROB 同步）。
+  void commit_store_head() {
+    if (cur_count == 0)
+      return;
+    auto &e = cur_entries[cur_head];
+    if (!e.occupied || !e.is_store || !e.write_done)
+      return;
+    next_entries[cur_head] = LSQEntry(); // 释放队首
+    next_committed++;
   }
 
   // store 提交启动：队首 store 已就绪且未启动 → 标记
@@ -206,12 +223,7 @@ public:
     return true;
   }
 
-  // 本周期是否有 store 写完成（step 中真正 write_mem 并释放槽位）
-  bool store_finished() const { return cur_store_finished; }
-
   void flush() {
-    // TODO(分支预测)：清空错误路径的访存条目，保留在途 load。
-    // 当前先整体清空，作为占位。
     for (int i = 0; i < SIZE; i++) {
       next_entries[i] = LSQEntry();
     }
@@ -219,7 +231,6 @@ public:
     next_committed = cur_count;
     next_left_cycle = 0;
     next_mem_execute_idx = -1;
-    next_store_finished = false;
   }
 
 private:
@@ -243,9 +254,9 @@ private:
     for (int i = 0; i < cur_count; i++) {
       if (cur_entries[idx].occupied) {
         if (cur_entries[idx].is_store) {
-          // 只有"已从 ROB 提交"的 store 才真正写内存；
-          // 投机期的 store 不碰内存、不占内存单元。
-          if (cur_entries[idx].committed)
+          // 只有"已从 ROB 提交"且未写完的 store 才真正写内存；
+          // 投机期的 store 不碰内存、不占内存单元；写完的不重复写。
+          if (cur_entries[idx].committed && !cur_entries[idx].write_done)
             return idx;
         } else {
           // load：必须等所有更老的 store 都写完（提交并真正写进内存）才能读，

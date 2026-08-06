@@ -10,9 +10,9 @@ struct ROBEntry {
   uint32_t pc;
   bool is_branch_taken;
   // ---- 分支预测相关 ----
-  bool pred_taken;    // 预测方向（issue 时写入）
+  bool pred_taken;        // 预测方向（issue 时写入）
   uint32_t pred_target;   // 预测目标 PC
-  bool actual_taken;  // 实际方向（writeback 广播时写入）
+  bool actual_taken;      // 实际方向（writeback 广播时写入）
   uint32_t actual_target; // 实际目标 PC
   ROBEntry()
       : busy(0), op(0), dest_reg(0), value(0), ready(0), pc(0),
@@ -32,8 +32,8 @@ class ROB {
   int next_issued;
   int next_committed;
 
-  int advance(int idx) { return (idx + 1) % ROB_SIZE; }
-  int advance_n(int idx, int n) { return (idx + n) % ROB_SIZE; }
+  int advance(int idx) const { return (idx + 1) % ROB_SIZE; }
+  int advance_n(int idx, int n) const { return (idx + n) % ROB_SIZE; }
 
 public:
   ROB()
@@ -85,4 +85,9 @@ public:
 
   bool is_full() const { return cur_count == ROB_SIZE; }
   bool is_empty() const { return cur_count == 0; }
+
+  // 7. 查询/读取（供发射阶段绕过 RAT 直接从 ROB 读已广播的结果）
+  bool is_ready(int rob_tag) const { return cur_rob[rob_tag].ready; }
+  uint32_t get_value(int rob_tag) const { return cur_rob[rob_tag].value; }
+  int get_head_tag() const { return cur_head; }
 };

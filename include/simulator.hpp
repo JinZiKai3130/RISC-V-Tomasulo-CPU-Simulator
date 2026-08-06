@@ -63,12 +63,14 @@ private:
       return;
 
     ROBEntry *head = rob.get_head_entry();
+    int head_tag = rob.get_head_tag();
 
     switch (head->op) {
     case OP_ALU: {
       // 写寄存器（ROB.value 来自 CDB 广播）
       if (head->dest_reg != 0)
         next_reg[head->dest_reg] = head->value;
+      status.clear_if_match(head_tag); // 提交后才清 RAT（寄存器已更新）
       rob.commit_head();
       break;
     }
@@ -77,16 +79,20 @@ private:
       if (lsq.commit_head()) {
         if (head->dest_reg != 0)
           next_reg[head->dest_reg] = head->value;
+        status.clear_if_match(head_tag); // 提交后才清 RAT（寄存器已更新）
         rob.commit_head();
       }
       break;
     }
     case OP_STORE: {
       // 队首 store 提交：此刻才正式启动内存写（投机期不碰内存）。
-      // 启动后由 LSQ::step() 串行写 3 周期，写完成当周期才提交 ROB。
-      lsq.start_commit_head();  // 未启动则标记 committed（排队写内存）
-      if (lsq.store_finished()) // 本周期写完成 → 释放 ROB 队首
-        rob.commit_head();
+      // 写完成后 LSQ 条目保留（write_done）直到本处随 ROB 一起释放，
+      // 保证 LSQ 队首始终与 ROB 队首同步，避免提交死锁。
+      lsq.start_commit_head();        // 未启动则标记 committed（排队写内存）
+      if (lsq.is_head_write_done()) { // 本周期（或此前）写完成
+        lsq.commit_store_head();      // 释放 LSQ 队首
+        rob.commit_head();            // 提交 ROB 队首
+      }
       break;
     }
     case OP_BRANCH: {
@@ -94,13 +100,15 @@ private:
       // 跳过）
       if (head->dest_reg > 0)
         next_reg[head->dest_reg] = head->value;
+      status.clear_if_match(head_tag); // 提交后才清 RAT（寄存器已更新）
       // 2. 比较预测 vs 实际：方向或目标任一不同 → 预测错误
       bool mispred = (head->pred_taken != head->actual_taken) ||
                      (head->pred_target != head->actual_target);
       if (mispred) {
         // 全部推翻重来：清空所有投机结构（ROB/RS/LSQ/RAT）。
         // 已提交的寄存器/内存结果不受影响（分支在队首时比它老的都已提交），
-        // 从实际目标重新取指。
+        // 从实际目标
+        // 重新取指。
         // 注意：错误路径上可能已取到 halt（next_halted=true），它是推测的，
         // 必须一并复位——halt 不进流水线，分支之后的 halt 一定是错误路径的。
         next_halted = false;
@@ -140,9 +148,11 @@ private:
 
     if (tag != -1) {
       // 广播副作用（全部写各部件 next）
-      rs.wakeup(tag, value);      // 唤醒 RS 依赖者（清 qj/qk）
-      rob.writeback(tag, value);  // 填 ROB（load/ALU 写结果；分支暂记 link 值）
-      status.clear_if_match(tag); // 清 RAT
+      rs.wakeup(tag, value);     // 唤醒 RS 依赖者（清 qj/qk）
+      rob.writeback(tag, value); // 填 ROB（load/ALU 写结果；分支暂记 link 值）
+      // 注意：此处不再清 RAT。寄存器堆只在 commit 时更新，若广播时就清 RAT，
+      // 则“已广播但未提交”期间发射的消费指令会读到寄存器旧值（如 s1=s0+16
+      // 读到了未提交的旧 s0）。RAT 条目在 do_commit 提交时统一清除。
       lsq.set_data_by_rob(tag, value); // store 的数据到达
 
       // 分支：把实际方向/目标写入 ROB（供 commit 时比较预测）
@@ -392,11 +402,29 @@ private:
       break;
     }
 
-    // 9. 读取源操作数：RAT 中有生产者标签则置 q=tag 等待，否则直接读寄存器
+    // 9. 读取源操作数：
+    //    RAT 中有生产者标签 → 若该 ROB 条目已广播(ready)则直接从 ROB 读结果
+    //    （生产者已算完、仅等 commit，CDB 不会再广播，必须在此取值）；
+    //    否则置 q=tag 等待 CDB 广播。无生产者标签 → 直接读寄存器堆。
     int qj = has_rs1 ? status.get_producer(dec.rs1) : -1;
     int qk = has_rs2 ? status.get_producer(dec.rs2) : -1;
-    int vj = (has_rs1 && qj == -1) ? cur_reg[dec.rs1] : 0;
-    int vk = (has_rs2 && qk == -1) ? cur_reg[dec.rs2] : 0;
+    int vj = 0, vk = 0;
+    if (has_rs1) {
+      if (qj != -1 && rob.is_ready(qj)) {
+        vj = (int)rob.get_value(qj);
+        qj = -1;
+      } else if (qj == -1) {
+        vj = (int)cur_reg[dec.rs1];
+      }
+    }
+    if (has_rs2) {
+      if (qk != -1 && rob.is_ready(qk)) {
+        vk = (int)rob.get_value(qk);
+        qk = -1;
+      } else if (qk == -1) {
+        vk = (int)cur_reg[dec.rs2];
+      }
+    }
 
     // 10. 分配 RS 槽位（所有指令都占用：ALU/分支算结果，访存算地址）
     //     同时拷贝执行所需的 dec/pc 信息（opcode/funct3/funct7/imm/pc）
