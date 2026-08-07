@@ -1,5 +1,43 @@
 #include "../include/RS.hpp"
 
+RS_Entry::RS_Entry()
+    : busy(0), op(0), opcode(0), funct3(0), funct7(0), imm(0), pc(0), vj(0),
+      vk(0), qj(0), qk(0), rob_tag(0), waiting(0), result(0), branch_taken(0),
+      branch_target(0) {}
+
+ReservationStation::ReservationStation()
+    : next_cdb_valid(false), next_cdb_tag(-1), next_cdb_value(0) {}
+
+void ReservationStation::take_snapshot() {
+  for (int i = 0; i < RS_SIZE; i++) {
+    next_rs[i] = cur_rs[i];
+  }
+  next_cdb_valid = false;
+}
+
+void ReservationStation::update() {
+  if (next_cdb_valid) {
+    // 这里确定有来自cdb(writeback)更新的操作，在update的时候进行相应的更新
+    for (int i = 0; i < RS_SIZE; i++) {
+      if (!next_rs[i].busy)
+        continue;
+      if (next_cdb_tag == next_rs[i].qj) {
+        next_rs[i].vj = (int)next_cdb_value;
+        next_rs[i].qj = -1;
+      }
+      if (next_cdb_tag == next_rs[i].qk) {
+        next_rs[i].vk = (int)next_cdb_value;
+        next_rs[i].qk = -1;
+      }
+    }
+  }
+  for (int i = 0; i < RS_SIZE; i++) {
+    cur_rs[i] = next_rs[i];
+  }
+}
+
+const RS_Entry &ReservationStation::peek(int idx) const { return cur_rs[idx]; }
+
 int ReservationStation::find_free_slot() {
   for (int i = 0; i < RS_SIZE; i++) {
     if (!cur_rs[i].busy) {
@@ -101,3 +139,5 @@ void ReservationStation::flush() {
   }
   next_cdb_valid = false;
 }
+
+bool ReservationStation::is_full() { return find_free_slot() == -1; }

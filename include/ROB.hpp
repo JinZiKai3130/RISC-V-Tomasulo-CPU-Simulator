@@ -14,10 +14,7 @@ struct ROBEntry {
   uint32_t pred_target;
   bool actual_taken;
   uint32_t actual_target;
-  ROBEntry()
-      : busy(0), op(0), dest_reg(0), value(0), ready(0), pc(0),
-        is_branch_taken(0), pred_taken(0), pred_target(0), actual_taken(0),
-        actual_target(0) {}
+  ROBEntry();
 };
 class ROB {
   static const int ROB_SIZE = 8;
@@ -31,30 +28,15 @@ class ROB {
   int next_issued;
   int next_committed;
 
-  int advance(int idx) const { return (idx + 1) % ROB_SIZE; }
-  int advance_n(int idx, int n) const { return (idx + n) % ROB_SIZE; }
+  int advance(int idx) const;
+  int advance_n(int idx, int n) const;
 
 public:
-  ROB()
-      : cur_head(0), cur_tail(0), cur_count(0), next_issued(0),
-        next_committed(0) {}
+  ROB();
 
-  void take_snapshot() {
-    for (int i = 0; i < ROB_SIZE; i++) {
-      next_rob[i] = cur_rob[i];
-    }
-    next_issued = 0;
-    next_committed = 0;
-  }
+  void take_snapshot();
 
-  void update() {
-    for (int i = 0; i < ROB_SIZE; i++) {
-      cur_rob[i] = next_rob[i];
-    }
-    cur_head = advance_n(cur_head, next_committed);
-    cur_tail = advance_n(cur_tail, next_issued);
-    cur_count = cur_count + next_issued - next_committed;
-  }
+  void update();
 
   int allocate(uint8_t op_type, int dest_reg, uint32_t pc);
 
@@ -72,10 +54,10 @@ public:
 
   void flush();
 
-  bool is_full() const { return cur_count == ROB_SIZE; }
-  bool is_empty() const { return cur_count == 0; }
+  bool is_full() const;
+  bool is_empty() const;
 
-  bool is_ready(int rob_tag) const { return cur_rob[rob_tag].ready; }
-  uint32_t get_value(int rob_tag) const { return cur_rob[rob_tag].value; }
-  int get_head_tag() const { return cur_head; }
+  bool is_ready(int rob_tag) const;
+  uint32_t get_value(int rob_tag) const;
+  int get_head_tag() const;
 };

@@ -22,6 +22,8 @@ add_executable(code
   src/memory.cpp
   src/ROB.cpp
   src/RS.cpp
+  src/RAT.cpp
+  src/LSQ.cpp
 )
 
 target_include_directories(code PRIVATE include)
